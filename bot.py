@@ -32,6 +32,7 @@ _DATETIME_FORMATS = (
 _REPEAT_KEYWORDS = {"every", "repeat", "каждый", "каждые"}
 
 
+
 def parse_duration(spec: str) -> Optional[timedelta]:
     """
     Convert strings like '10m', '1h20m', '2d3h' to timedelta.
