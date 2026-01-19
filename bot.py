@@ -6,10 +6,11 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-from telegram import Update, User
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     Defaults,
@@ -30,6 +31,9 @@ _DATETIME_FORMATS = (
     "%Y-%m-%dT%H:%M",
 )
 _REPEAT_KEYWORDS = {"every", "repeat", "каждый", "каждые"}
+_QUIET_HOURS_START = 22
+_QUIET_HOURS_END = 8
+_INTERVAL_OPTIONS = ["10m", "30m", "1h", "2h", "6h", "12h", "24h"]
 
 
 
@@ -111,6 +115,191 @@ def normalize_target_label(label: Optional[str]) -> tuple[Optional[str], bool]:
     return label, False
 
 
+def is_quiet_hours(now: Optional[datetime] = None) -> bool:
+    current = now or datetime.now()
+    hour = current.hour
+    if _QUIET_HOURS_START < _QUIET_HOURS_END:
+        return _QUIET_HOURS_START <= hour < _QUIET_HOURS_END
+    return hour >= _QUIET_HOURS_START or hour < _QUIET_HOURS_END
+
+
+def next_allowed_time(now: Optional[datetime] = None) -> datetime:
+    current = now or datetime.now()
+    if not is_quiet_hours(current):
+        return current
+    if current.hour < _QUIET_HOURS_END:
+        return current.replace(
+            hour=_QUIET_HOURS_END, minute=0, second=0, microsecond=0
+        )
+    next_day = current + timedelta(days=1)
+    return next_day.replace(hour=_QUIET_HOURS_END, minute=0, second=0, microsecond=0)
+
+
+def build_main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Создать напоминание", callback_data="flow:relative")],
+            [
+                InlineKeyboardButton(
+                    "Создать напоминание на дату и время",
+                    callback_data="flow:datetime",
+                )
+            ],
+        ]
+    )
+
+
+def build_interval_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for value in _INTERVAL_OPTIONS:
+        current_row.append(
+            InlineKeyboardButton(value, callback_data=f"{prefix}:{value}")
+        )
+        if len(current_row) == 3:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_target_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("ALL", callback_data="target:all"),
+                InlineKeyboardButton("Без адресата", callback_data="target:none"),
+            ],
+            [InlineKeyboardButton("Указать вручную", callback_data="target:custom")],
+        ]
+    )
+
+
+def build_repeat_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for value in _INTERVAL_OPTIONS:
+        current_row.append(
+            InlineKeyboardButton(value, callback_data=f"repeat:{value}")
+        )
+        if len(current_row) == 3:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    rows.append([InlineKeyboardButton("Нет повтора", callback_data="repeat:none")])
+    return InlineKeyboardMarkup(rows)
+
+
+def reset_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("reminder_flow", None)
+
+
+async def delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logger.exception("Failed to delete message %s in chat %s", message_id, chat_id)
+
+
+async def send_flow_prompt(message, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    flow = context.user_data.get("reminder_flow")
+    prompt = await context.bot.send_message(
+        chat_id=message.chat_id, text=text, reply_markup=reply_markup
+    )
+    if flow and flow.get("clean_chat") and flow.get("last_prompt_id"):
+        await delete_message_safe(context, message.chat_id, flow["last_prompt_id"])
+    if flow and prompt:
+        flow["last_prompt_id"] = prompt.message_id
+    return prompt
+
+
+async def schedule_reminder(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    due_at: datetime,
+    target_label: Optional[str],
+    target_user: Optional[User],
+    reminder_text: str,
+    repeat_interval: Optional[timedelta],
+    reply_to_message_id: Optional[int],
+) -> None:
+    now = datetime.now()
+    delay = max(due_at - now, timedelta(seconds=1))
+
+    job_queue = context.job_queue or context.application.job_queue
+    if not job_queue:
+        await message.reply_text("Внутренняя ошибка: очередь задач недоступна.")
+        return
+
+    chat_id = message.chat_id
+    job_id = f"{chat_id}-{int(time.time() * 1000)}"
+
+    target_label, is_all_target = normalize_target_label(target_label)
+    mention = None
+    if target_label:
+        mention = html.escape(target_label) if is_all_target else format_target_mention(target_user, target_label)
+
+    job_data = {
+        "chat_id": chat_id,
+        "mention": mention,
+        "text": reminder_text,
+        "reply_to": reply_to_message_id,
+        "due_at": due_at,
+        "repeat_interval": repeat_interval,
+    }
+
+    if repeat_interval:
+        job = job_queue.run_repeating(
+            send_reminder,
+            interval=repeat_interval,
+            first=delay,
+            name=job_id,
+            data=job_data,
+        )
+    else:
+        job = job_queue.run_once(
+            send_reminder,
+            when=delay,
+            name=job_id,
+            data=job_data,
+        )
+
+    chat_jobs = context.chat_data.setdefault("jobs", {})
+    chat_jobs[job_id] = {
+        "job": job,
+        "target": mention,
+        "text": reminder_text,
+        "due_at": due_at,
+        "repeat_interval": repeat_interval,
+    }
+
+    target_display = chat_jobs[job_id]["target"] or "без адресата"
+    repeat_note = (
+        f"\nПовтор: каждые {humanize_delta(repeat_interval)}"
+        if repeat_interval
+        else ""
+    )
+    confirmation = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🗓️ Запланировано для {target_display} через {humanize_delta(delay)}.\n"
+            f"ID: <code>{job_id}</code>\n"
+            f"Текст: {html.escape(reminder_text)}"
+            f"{repeat_note}"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    if confirmation:
+        context.job_queue.run_once(
+            delete_message_job,
+            when=15,
+            data={"chat_id": confirmation.chat_id, "message_id": confirmation.message_id},
+        )
+
+
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
     if not job or not job.data:
@@ -122,6 +311,31 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     text = data["text"]
     reply_to = data.get("reply_to")
     repeat_interval = data.get("repeat_interval")
+
+    now = datetime.now()
+    if is_quiet_hours(now):
+        chat_jobs = context.application.chat_data.get(chat_id, {}).get("jobs", {})
+        if repeat_interval:
+            data["due_at"] = now + repeat_interval
+            if job.name in chat_jobs:
+                chat_jobs[job.name]["due_at"] = data["due_at"]
+            return
+        reschedule_for = next_allowed_time(now)
+        delay = max(reschedule_for - now, timedelta(seconds=1))
+        job_queue = context.job_queue or context.application.job_queue
+        new_job = None
+        if job_queue:
+            new_job = job_queue.run_once(
+                send_reminder,
+                when=delay,
+                name=job.name,
+                data=data,
+            )
+        if job.name in chat_jobs:
+            chat_jobs[job.name]["due_at"] = reschedule_for
+            if new_job:
+                chat_jobs[job.name]["job"] = new_job
+        return
 
     if mention:
         reminder_text = f"⏰ Напоминание для {mention}:\n{html.escape(text)}"
@@ -171,12 +385,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• На дату и время + Повтор: /remind 2024-12-31 18:00 every 1h текст\n"
         "Форматы времени: s — сек, m — мин, h — час, d — день.\n"
         "Форматы даты/времени: YYYY-MM-DD HH:MM или YYYY-MM-DDTHH:MM.\n\n"
+        "Режим тишины: бот не отправляет напоминания с 22:00 до 08:00.\n\n"
         "/list — показать активные напоминания\n"
         "/cancel ID — отменить напоминание\n"
         "/cancel All — отменить все напоминания"
     )
     if update.effective_message:
-        await update.effective_message.reply_html(html.escape(msg))
+        await update.effective_message.reply_html(
+            html.escape(msg), reply_markup=build_main_menu_keyboard()
+        )
 
 
 async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -235,7 +452,6 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Received /remind from chat %s: %s", message.chat_id, message.text)
     target_user: Optional[User] = None
     target_label: Optional[str] = None
-    is_all_target = False
     repeat_interval: Optional[timedelta] = None
     reminder_text = ""
 
@@ -309,71 +525,223 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         remaining = remaining[2:]
 
     reminder_text = " ".join(remaining).strip() or "Напоминание!"
-    target_label, is_all_target = normalize_target_label(target_label)
+    await schedule_reminder(
+        message,
+        context,
+        due_at=due_at,
+        target_label=target_label,
+        target_user=target_user,
+        reminder_text=reminder_text,
+        repeat_interval=repeat_interval,
+        reply_to_message_id=(
+            message.reply_to_message.message_id if message.reply_to_message else None
+        ),
+    )
 
-    job_queue = context.job_queue or context.application.job_queue
-    if not job_queue:
-        await message.reply_text("Внутренняя ошибка: очередь задач недоступна.")
+
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+
+    data = query.data
+    if data == "flow:relative":
+        context.user_data["reminder_flow"] = {
+            "type": "relative",
+            "step": "interval",
+            "clean_chat": True,
+        }
+        await send_flow_prompt(
+            query.message,
+            context,
+            "Выбери интервал:",
+            reply_markup=build_interval_keyboard("interval"),
+        )
         return
 
-    chat_id = message.chat_id
-    job_id = f"{chat_id}-{int(time.time() * 1000)}"
-    mention = None
-    if target_label:
-        mention = html.escape(target_label) if is_all_target else format_target_mention(target_user, target_label)
+    if data == "flow:datetime":
+        context.user_data["reminder_flow"] = {
+            "type": "datetime",
+            "step": "date_input",
+            "clean_chat": True,
+        }
+        await send_flow_prompt(query.message, context, "Введи дату в формате YYYY-MM-DD.")
+        return
 
-    job_data = {
-        "chat_id": chat_id,
-        "mention": mention,
-        "text": reminder_text,
-        "reply_to": message.reply_to_message.message_id if message.reply_to_message else None,
-        "due_at": due_at,
-        "repeat_interval": repeat_interval,
-    }
+    flow = context.user_data.get("reminder_flow")
+    if not flow:
+        await query.message.reply_text("Сначала запусти /start.")
+        return
 
-    if repeat_interval:
-        job = job_queue.run_repeating(
-            send_reminder,
-            interval=repeat_interval,
-            first=delay,
-            name=job_id,
-            data=job_data,
+    if data.startswith("interval:"):
+        if flow.get("type") != "relative" or flow.get("step") != "interval":
+            return
+        flow["interval"] = data.split(":", 1)[1]
+        flow["step"] = "target"
+        await send_flow_prompt(
+            query.message,
+            context,
+            "Выбери адресата:",
+            reply_markup=build_target_keyboard(),
         )
-    else:
-        job = job_queue.run_once(
-            send_reminder,
-            when=delay,
-            name=job_id,
-            data=job_data,
-        )
+        return
 
-    chat_jobs = context.chat_data.setdefault("jobs", {})
-    chat_jobs[job_id] = {
-        "job": job,
-        "target": mention,
-        "text": reminder_text,
-        "due_at": due_at,
-        "repeat_interval": repeat_interval,
-    }
+    if data.startswith("target:"):
+        target_choice = data.split(":", 1)[1]
+        flow["target_label"] = None
+        flow["clean_chat"] = True
+        if target_choice == "all":
+            flow["target_label"] = "ALL"
+        elif target_choice == "custom":
+            flow["step"] = "target_input"
+            await send_flow_prompt(
+                query.message,
+                context,
+                "Укажи пользователя (например, @username) или имя."
+            )
+            return
 
-    target_display = chat_jobs[job_id]["target"] or "без адресата"
-    repeat_note = (
-        f"\nПовтор: каждые {humanize_delta(repeat_interval)}"
-        if repeat_interval
-        else ""
-    )
-    confirmation = await message.reply_html(
-        f"🗓️ Запланировано для {target_display} через {humanize_delta(delay)}.\n"
-        f"ID: <code>{job_id}</code>\n"
-        f"Текст: {html.escape(reminder_text)}"
-        f"{repeat_note}"
-    )
-    if confirmation:
-        context.job_queue.run_once(
-            delete_message_job,
-            when=15,
-            data={"chat_id": confirmation.chat_id, "message_id": confirmation.message_id},
+        if flow.get("type") == "relative":
+            flow["step"] = "repeat"
+            await send_flow_prompt(
+                query.message,
+                context,
+                "Выбери повтор:",
+                reply_markup=build_repeat_keyboard(),
+            )
+        else:
+            flow["step"] = "text_input"
+            await send_flow_prompt(query.message, context, "Добавь текст напоминания.")
+        return
+
+    if data.startswith("repeat:"):
+        if flow.get("type") != "relative" or flow.get("step") != "repeat":
+            return
+        repeat_choice = data.split(":", 1)[1]
+        flow["repeat_interval"] = (
+            None if repeat_choice == "none" else repeat_choice
         )
+        flow["step"] = "text_input"
+        await send_flow_prompt(query.message, context, "Добавь текст напоминания.")
+
+
+async def handle_flow_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    if message.text.strip().startswith("/"):
+        return
+
+    flow = context.user_data.get("reminder_flow")
+    if not flow:
+        return
+
+    step = flow.get("step")
+    if step == "target_input":
+        label = message.text.strip()
+        if not label:
+            await message.reply_text("Нужно указать имя или @username.")
+            return
+        if flow.get("clean_chat"):
+            await delete_message_safe(context, message.chat_id, message.message_id)
+        flow["target_label"] = label
+        if flow.get("type") == "relative":
+            flow["step"] = "repeat"
+            await send_flow_prompt(
+                message,
+                context,
+                "Выбери повтор:",
+                reply_markup=build_repeat_keyboard(),
+            )
+        else:
+            flow["step"] = "text_input"
+            await send_flow_prompt(message, context, "Добавь текст напоминания.")
+        return
+
+    if step == "date_input":
+        date_text = message.text.strip()
+        try:
+            flow["date"] = datetime.strptime(date_text, "%Y-%m-%d").date()
+        except ValueError:
+            await message.reply_text("Не понял дату. Формат: YYYY-MM-DD.")
+            return
+        if flow.get("clean_chat"):
+            await delete_message_safe(context, message.chat_id, message.message_id)
+        flow["step"] = "time_input"
+        await send_flow_prompt(message, context, "Теперь введи время в формате HH:MM.")
+        return
+
+    if step == "time_input":
+        time_text = message.text.strip()
+        try:
+            time_value = datetime.strptime(time_text, "%H:%M").time()
+        except ValueError:
+            await message.reply_text("Не понял время. Формат: HH:MM.")
+            return
+        if flow.get("clean_chat"):
+            await delete_message_safe(context, message.chat_id, message.message_id)
+        date_value = flow.get("date")
+        if not date_value:
+            reset_flow(context)
+            await message.reply_text("Потерял дату. Начни заново через /start.")
+            return
+        due_at = datetime.combine(date_value, time_value)
+        if due_at <= datetime.now():
+            await message.reply_text("Указанная дата/время уже прошла.")
+            return
+        flow["due_at"] = due_at
+        flow["step"] = "target"
+        await send_flow_prompt(
+            message,
+            context,
+            "Выбери адресата:",
+            reply_markup=build_target_keyboard(),
+        )
+        return
+
+    if step == "text_input":
+        text = message.text.strip()
+        if not text:
+            await message.reply_text("Текст напоминания не должен быть пустым.")
+            return
+        if flow.get("clean_chat"):
+            await delete_message_safe(context, message.chat_id, message.message_id)
+            if flow.get("last_prompt_id"):
+                await delete_message_safe(context, message.chat_id, flow["last_prompt_id"])
+                flow["last_prompt_id"] = None
+        flow_type = flow.get("type")
+        if flow_type == "relative":
+            interval = parse_duration(flow.get("interval", ""))
+            if not interval:
+                reset_flow(context)
+                await message.reply_text("Потерял интервал. Начни заново через /start.")
+                return
+            due_at = datetime.now() + interval
+            repeat_spec = flow.get("repeat_interval")
+            repeat_interval = parse_duration(repeat_spec) if repeat_spec else None
+        else:
+            due_at = flow.get("due_at")
+            repeat_interval = None
+
+        if not due_at:
+            reset_flow(context)
+            await message.reply_text(
+                "Не могу определить время напоминания. Начни заново через /start."
+            )
+            return
+
+        await schedule_reminder(
+            message,
+            context,
+            due_at=due_at,
+            target_label=flow.get("target_label"),
+            target_user=None,
+            reminder_text=text,
+            repeat_interval=repeat_interval,
+            reply_to_message_id=None,
+        )
+        reset_flow(context)
 
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,6 +865,10 @@ def main() -> None:
     application.add_handler(CommandHandler("remind", remind))
     application.add_handler(CommandHandler("list", list_reminders))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CallbackQueryHandler(handle_menu_callback), group=0)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_flow_text), group=0
+    )
     application.add_handler(MessageHandler(filters.ALL, handle_text_command, block=False), group=1)
     application.add_handler(MessageHandler(filters.ALL, log_update, block=False), group=2)
 
